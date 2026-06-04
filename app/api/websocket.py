@@ -25,7 +25,9 @@ class ConnectionManager:
                 "alive": {},
                 "votes": {},
                 "night_actions": {},
-                "profiles": {}
+                "profiles": {},
+                "phase": "LOBBY",
+                "host": player_name
             }
         
         self.active_connections[room_code][player_name] = websocket
@@ -37,6 +39,19 @@ class ConnectionManager:
         if room_code in self.active_connections:
             if player_name in self.active_connections[room_code]:
                 del self.active_connections[room_code][player_name]
+            
+            # Clean up the player lists if the game is still in LOBBY phase
+            state = GAME_ROOMS.get(room_code)
+            if state and state.get("phase") == "LOBBY":
+                if player_name in state["players"]:
+                    state["players"].remove(player_name)
+                if state.get("host") == player_name:
+                    state["host"] = state["players"][0] if state["players"] else None
+                if player_name in state["alive"]:
+                    del state["alive"][player_name]
+                if player_name in state["profiles"]:
+                    del state["profiles"][player_name]
+
             if not self.active_connections[room_code]:
                 del self.active_connections[room_code]
                 if room_code in GAME_ROOMS:
@@ -91,7 +106,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
     await manager.broadcast_to_room({
         "event": "room_sync",
         "players": state["players"],
-        "profiles": state["profiles"]
+        "profiles": state["profiles"],
+        "host": state.get("host")
     }, room_code)
     
     await manager.broadcast_to_room({
@@ -117,7 +133,14 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
             # 2. GUARANTEED CARD DEALER
             elif action == "start_game":
-                players = [p for p in state["players"] if state["alive"].get(p, True)]
+                if state.get("host") != player_name:
+                    continue
+                state["phase"] = "NIGHT"
+                state["night_actions"].clear()
+                state["votes"].clear()
+                for p in state["players"]:
+                    state["alive"][p] = True
+                players = state["players"]
                 
                 if len(players) < 4:
                     # Low player count setup: Always guarantee exactly 1 Mafia
@@ -154,6 +177,9 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
             # 4. SUNRISE / MORNING BRIEFING CALCULATION
             elif action == "sunrise":
+                if state.get("phase") != "NIGHT":
+                    continue
+                state["phase"] = "DAY"
                 winner = check_victory_conditions(room_code)
                 if winner:
                     await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
@@ -190,6 +216,9 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
             # 6. DUSK / LYNCHING CALCULATION
             elif action == "dusk":
+                if state.get("phase") != "DAY":
+                    continue
+                state["phase"] = "NIGHT"
                 winner = check_victory_conditions(room_code)
                 if winner:
                     await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
@@ -223,6 +252,14 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
     except WebSocketDisconnect:
         manager.disconnect(room_code, player_name)
+        state = GAME_ROOMS.get(room_code)
+        if state:
+            await manager.broadcast_to_room({
+                "event": "room_sync",
+                "players": state["players"],
+                "profiles": state["profiles"],
+                "host": state.get("host")
+            }, room_code)
         await manager.broadcast_to_room({
             "event": "player_left",
             "player_name": player_name,
