@@ -174,6 +174,17 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 role = packet.get("role")
                 target = packet.get("target")
                 state["night_actions"][role] = target
+                
+                # If the action is initiated by the COP, immediately reply with alignment result
+                if role == "COP":
+                    target_role = state["roles"].get(target, "STUDENT")
+                    is_mafia = (target_role == "MAFIA")
+                    await manager.send_personal_message({
+                        "event": "investigation_result",
+                        "target": target,
+                        "is_mafia": is_mafia,
+                        "role": target_role
+                    }, room_code, player_name)
 
             # 4. SUNRISE / MORNING BRIEFING CALCULATION
             elif action == "sunrise":
