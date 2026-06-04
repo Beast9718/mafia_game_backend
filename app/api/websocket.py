@@ -171,6 +171,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
             # 3. NIGHT ACTION RESOLUTION
             elif action == "night_action":
+                if not state["alive"].get(player_name, False):
+                    continue
                 role = packet.get("role")
                 target = packet.get("target")
                 state["night_actions"][role] = target
@@ -230,6 +232,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
             # 5. DAY VOTING SYSTEM
             elif action == "day_action":
+                if not state["alive"].get(player_name, False):
+                    continue
                 voter = packet.get("voter")
                 target = packet.get("target")
                 state["votes"][voter] = target
