@@ -1,0 +1,22 @@
+# Environments
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Preventative Security & Secrets (Even if you don't have them yet)
+.env
+.env.*
+secrets.json
+credentials.json
+*.pem
+*.key
+
+# Database
+*.sqlite3
+*.db
+
+# IDEs
+.vscode/
+.idea/
