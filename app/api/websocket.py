@@ -175,6 +175,10 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 target = packet.get("target")
                 state["night_actions"][role] = target
                 
+                # Cache the recorded video if it's the MAFIA action
+                if role == "MAFIA":
+                    state["murder_video"] = packet.get("videoBase64")
+                
                 # If the action is initiated by the COP, immediately reply with alignment result
                 if role == "COP":
                     target_role = state["roles"].get(target, "STUDENT")
@@ -200,17 +204,22 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 doctor_target = state["night_actions"].get("DOCTOR")
                 
                 victim = None
+                murder_video = None
                 if mafia_target and mafia_target != doctor_target:
                     victim = mafia_target
+                    murder_video = state.get("murder_video")
                     state["alive"][victim] = False
 
                 # Clear entries for next round
                 state["night_actions"].clear()
                 state["votes"].clear()
+                if "murder_video" in state:
+                    del state["murder_video"]
 
                 await manager.broadcast_to_room({
                     "event": "morning_briefing",
-                    "victim": victim
+                    "victim": victim,
+                    "videoBase64": murder_video
                 }, room_code)
 
                 # Check if the night murder ended the match
