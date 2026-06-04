@@ -2,7 +2,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Format: postgresql://username:password@host:port/database_name
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:vnq5gkcxnu@localhost:5432/mafia_db"
+# ✅ SAFE
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# This tells Python to look in your hidden .env file or Render's vault!
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Notice we removed `connect_args={"check_same_thread": False}` 
 # That is only needed for SQLite!

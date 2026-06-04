@@ -2,9 +2,13 @@ from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import jwt
 import os
+from dotenv import load_dotenv
 
-# Security configuration (In production, load these from .env)
-SECRET_KEY = "D3AD_N1T3_SUPER_SECRET_KEY_CHANGE_ME"
+# This command looks for the .env file and loads it into memory
+load_dotenv() 
+
+# Now you can safely grab your secrets!
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
