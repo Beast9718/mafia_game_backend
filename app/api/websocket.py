@@ -33,7 +33,8 @@ class ConnectionManager:
         self.active_connections[room_code][player_name] = websocket
         if player_name not in GAME_ROOMS[room_code]["players"]:
             GAME_ROOMS[room_code]["players"].append(player_name)
-        GAME_ROOMS[room_code]["alive"][player_name] = True
+        if player_name not in GAME_ROOMS[room_code]["alive"]:
+            GAME_ROOMS[room_code]["alive"][player_name] = True
 
     def disconnect(self, room_code: str, player_name: str):
         if room_code in self.active_connections:
@@ -107,7 +108,9 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
         "event": "room_sync",
         "players": state["players"],
         "profiles": state["profiles"],
-        "host": state.get("host")
+        "host": state.get("host"),
+        "phase": state.get("phase", "LOBBY"),
+        "alive": state.get("alive", {})
     }, room_code)
     
     await manager.broadcast_to_room({
@@ -115,6 +118,15 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
         "player_name": player_name,
         "message": f"{player_name} has entered the nightmare."
     }, room_code)
+
+    # If the game has already started, resend the player's role to them!
+    if state.get("phase") in ["DAY", "NIGHT"]:
+        role = state["roles"].get(player_name)
+        if role:
+            await manager.send_personal_message({
+                "event": "role_assigned",
+                "role": role
+            }, room_code, player_name)
 
     try:
         while True:
@@ -288,7 +300,9 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 "event": "room_sync",
                 "players": state["players"],
                 "profiles": state["profiles"],
-                "host": state.get("host")
+                "host": state.get("host"),
+                "phase": state.get("phase", "LOBBY"),
+                "alive": state.get("alive", {})
             }, room_code)
         await manager.broadcast_to_room({
             "event": "player_left",
