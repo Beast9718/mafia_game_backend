@@ -1,7 +1,7 @@
 import asyncio
 import json
 import random
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from typing import Dict, List
 
 router = APIRouter()
@@ -98,23 +98,113 @@ def check_victory_conditions(room_code: str) -> str:
     return None
 
 @router.websocket("/ws/{room_code}/{player_name}")
-async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: str):
+async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: str, token: str = None):
+    room_code = room_code.upper()
+    
+    # 1. JWT Token Validation (if token is provided and is not offline_bypass)
+    if token and token != "offline_bypass_token" and token != "offline_fallback_token":
+        from jose import jwt
+        from ..core.security import SECRET_KEY, ALGORITHM
+        from ..database import SessionLocal
+        from ..models.models import User
+        
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("sub")
+            if not user_id:
+                await websocket.accept()
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            with SessionLocal() as db:
+                user = db.query(User).filter(User.id == int(user_id)).first()
+                if not user or user.username != player_name:
+                    await websocket.accept()
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+        except Exception:
+            await websocket.accept()
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+    # 2. Ensure user exists in database (needed for foreign keys)
+    from ..database import SessionLocal
+    from ..models.models import User, Room, Player, GamePhase
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.username == player_name).first()
+        if not user:
+            from ..core.security import get_password_hash
+            user = User(username=player_name, hashed_password=get_password_hash(f"{player_name.lower()}@mafia2026"))
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+    # 3. Reconstruct room state in memory from database if missing (server restart recovery)
+    if room_code not in manager.active_connections:
+        with SessionLocal() as db:
+            db_room = db.query(Room).filter(Room.room_code == room_code).first()
+            if db_room and db_room.phase != GamePhase.FINISHED:
+                db_players = db.query(Player).filter(Player.room_id == db_room.id).all()
+                players_list = []
+                roles_dict = {}
+                alive_dict = {}
+                profiles_dict = {}
+                
+                host_username = None
+                for dp in db_players:
+                    p_user = db.query(User).filter(User.id == dp.user_id).first()
+                    if p_user:
+                        players_list.append(p_user.username)
+                        roles_dict[p_user.username] = dp.role
+                        alive_dict[p_user.username] = dp.is_alive
+                        profiles_dict[p_user.username] = dp.profile_image_path
+                        if dp.is_host:
+                            host_username = p_user.username
+                
+                GAME_ROOMS[room_code] = {
+                    "players": players_list,
+                    "roles": roles_dict,
+                    "alive": alive_dict,
+                    "votes": {},
+                    "night_actions": {},
+                    "profiles": profiles_dict,
+                    "phase": db_room.phase.value,
+                    "host": host_username
+                }
+                manager.active_connections[room_code] = {}
+
     await manager.connect(websocket, room_code, player_name)
-    
-    # Sync room status with the newly joined player
     state = GAME_ROOMS[room_code]
-    await manager.broadcast_to_room({
-        "event": "room_sync",
-        "players": state["players"],
-        "profiles": state["profiles"],
-        "host": state.get("host")
-    }, room_code)
     
-    await manager.broadcast_to_room({
-        "event": "player_joined",
-        "player_name": player_name,
-        "message": f"{player_name} has entered the nightmare."
-    }, room_code)
+    # 4. Route returning player immediately vs standard lobby sync
+    if state["phase"] != "LOBBY":
+        player_role = state["roles"].get(player_name, "STUDENT")
+        await manager.send_personal_message({
+            "event": "rejoin_sync",
+            "phase": state["phase"],
+            "role": player_role,
+            "players": [
+                {
+                    "name": p,
+                    "avatarBase64": state["profiles"].get(p),
+                    "isAlive": state["alive"].get(p, True)
+                }
+                for p in state["players"]
+            ]
+        }, room_code, player_name)
+    else:
+        await manager.broadcast_to_room({
+            "event": "room_sync",
+            "players": state["players"],
+            "profiles": state["profiles"],
+            "host": state.get("host")
+        }, room_code)
+        
+        await manager.broadcast_to_room({
+            "event": "player_joined",
+            "player_name": player_name,
+            "message": f"{player_name} has entered the nightmare."
+        }, room_code)
 
     try:
         while True:
@@ -166,6 +256,43 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                         "event": "role_assigned",
                         "role": role
                     }, room_code, p)
+
+                # Save session details to PostgreSQL database
+                from ..models.models import Room, Player, User, GamePhase
+                with SessionLocal() as db:
+                    db_room = db.query(Room).filter(Room.room_code == room_code).first()
+                    host_user = db.query(User).filter(User.username == state["host"]).first()
+                    host_id = host_user.id if host_user else None
+                    
+                    if not db_room:
+                        db_room = Room(room_code=room_code, phase=GamePhase.NIGHT, host_id=host_id)
+                        db.add(db_room)
+                    else:
+                        db_room.phase = GamePhase.NIGHT
+                        db_room.host_id = host_id
+                    
+                    db.commit()
+                    db.refresh(db_room)
+                    
+                    # Clean out previous players
+                    db.query(Player).filter(Player.room_id == db_room.id).delete()
+                    db.commit()
+                    
+                    # Add current players and their roles
+                    for p in state["players"]:
+                        user = db.query(User).filter(User.username == p).first()
+                        if user:
+                            role = state["roles"].get(p)
+                            db_player = Player(
+                                room_id=db_room.id,
+                                user_id=user.id,
+                                role=role,
+                                is_alive=state["alive"].get(p, True),
+                                is_host=(p == state["host"]),
+                                profile_image_path=state["profiles"].get(p)
+                            )
+                            db.add(db_player)
+                    db.commit()
 
                 await manager.broadcast_to_room({"event": "game_started"}, room_code)
 
@@ -223,6 +350,19 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 if "murder_video" in state:
                     del state["murder_video"]
 
+                # Update player is_alive state and phase in PostgreSQL database
+                from ..models.models import Room, Player, User, GamePhase
+                with SessionLocal() as db:
+                    db_room = db.query(Room).filter(Room.room_code == room_code).first()
+                    if db_room:
+                        db_room.phase = GamePhase.DAY
+                        db_players = db.query(Player).filter(Player.room_id == db_room.id).all()
+                        for db_p in db_players:
+                            user = db.query(User).filter(User.id == db_p.user_id).first()
+                            if user and user.username in state["alive"]:
+                                db_p.is_alive = state["alive"][user.username]
+                        db.commit()
+
                 await manager.broadcast_to_room({
                     "event": "morning_briefing",
                     "victim": victim,
@@ -233,6 +373,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 # Check if the night murder ended the match
                 winner = check_victory_conditions(room_code)
                 if winner:
+                    with SessionLocal() as db:
+                        db_room = db.query(Room).filter(Room.room_code == room_code).first()
+                        if db_room:
+                            db_room.phase = GamePhase.FINISHED
+                            db.commit()
                     await asyncio.sleep(1) # Small buffer to let morning briefing land
                     await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
 
@@ -269,6 +414,19 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
                 state["votes"].clear()
 
+                # Update living status and phase in PostgreSQL database
+                from ..models.models import Room, Player, User, GamePhase
+                with SessionLocal() as db:
+                    db_room = db.query(Room).filter(Room.room_code == room_code).first()
+                    if db_room:
+                        db_room.phase = GamePhase.NIGHT
+                        db_players = db.query(Player).filter(Player.room_id == db_room.id).all()
+                        for db_p in db_players:
+                            user = db.query(User).filter(User.id == db_p.user_id).first()
+                            if user and user.username in state["alive"]:
+                                db_p.is_alive = state["alive"][user.username]
+                        db.commit()
+
                 await manager.broadcast_to_room({
                     "event": "dusk_briefing",
                     "executed": executed
@@ -277,6 +435,11 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 # Check if the execution ended the match
                 winner = check_victory_conditions(room_code)
                 if winner:
+                    with SessionLocal() as db:
+                        db_room = db.query(Room).filter(Room.room_code == room_code).first()
+                        if db_room:
+                            db_room.phase = GamePhase.FINISHED
+                            db.commit()
                     await asyncio.sleep(1)
                     await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
 
