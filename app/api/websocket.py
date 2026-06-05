@@ -207,10 +207,15 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 
                 victim = None
                 murder_video = None
-                if mafia_target and mafia_target != doctor_target:
-                    victim = mafia_target
-                    murder_video = state.get("murder_video")
-                    state["alive"][victim] = False
+                doctor_saved = False
+                
+                if mafia_target:
+                    if doctor_target and mafia_target == doctor_target:
+                        doctor_saved = True
+                    else:
+                        victim = mafia_target
+                        murder_video = state.get("murder_video")
+                        state["alive"][victim] = False
 
                 # Clear entries for next round
                 state["night_actions"].clear()
@@ -221,7 +226,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 await manager.broadcast_to_room({
                     "event": "morning_briefing",
                     "victim": victim,
-                    "videoBase64": murder_video
+                    "videoBase64": murder_video,
+                    "doctorSaved": doctor_saved
                 }, room_code)
 
                 # Check if the night murder ended the match
