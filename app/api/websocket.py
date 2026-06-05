@@ -271,8 +271,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
 
                 await manager.broadcast_to_room({
                     "event": "dusk_briefing",
-                    "executed": executed,
-                    "role": state["roles"].get(executed) if executed else None
+                    "executed": executed
                 }, room_code)
 
                 # Check if the execution ended the match
