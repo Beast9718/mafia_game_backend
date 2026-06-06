@@ -397,6 +397,21 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                     await asyncio.sleep(1)
                     await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
 
+            # 7. RETURN TO LOBBY / RESET GAME
+            elif action == "return_to_lobby":
+                state["phase"] = "LOBBY"
+                state["roles"].clear()
+                state["night_actions"].clear()
+                state["votes"].clear()
+                for p in state["players"]:
+                    state["alive"][p] = True
+                if "murder_video" in state:
+                    del state["murder_video"]
+                if "murder_phrase" in state:
+                    del state["murder_phrase"]
+                
+                await broadcast_room_sync(room_code)
+
     except WebSocketDisconnect:
         manager.disconnect(room_code, player_name)
         state = GAME_ROOMS.get(room_code)
