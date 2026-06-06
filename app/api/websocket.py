@@ -83,7 +83,7 @@ async def verify_ritual_video(video_base64: str, target: str, kill_phrase: str) 
         print("WARNING: GEMINI_API_KEY is not set. Automatically passing verification in development mode.")
         return True, "Dev Mode Bypass: Verification passed (No API Key set)."
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     
     headers = {"Content-Type": "application/json"}
     
