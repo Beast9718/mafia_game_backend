@@ -1,6 +1,8 @@
 import asyncio
 import json
 import random
+import os
+import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict, List
 
@@ -74,7 +76,71 @@ class ConnectionManager:
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+async def verify_ritual_video(video_base64: str, target: str, kill_phrase: str) -> tuple[bool, str]:
+    if not GEMINI_API_KEY:
+        print("WARNING: GEMINI_API_KEY is not set. Automatically passing verification in development mode.")
+        return True, "Dev Mode Bypass: Verification passed (No API Key set)."
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    headers = {"Content-Type": "application/json"}
+    
+    prompt = (
+        f"You are the game arbitrator for a creepy Mafia game. The video shows a mafia player recording their kill ritual.\n"
+        f"The player was required to perform the following two actions:\n"
+        f"1. Write the exact phrase: \"{kill_phrase}\" on a piece of paper and show it to the camera.\n"
+        f"2. Speak the exact phrase: \"{kill_phrase}\" out loud.\n\n"
+        f"The target player's name is \"{target}\", which is part of the phrase.\n\n"
+        f"Determine if the player successfully and correctly executed both the writing and speaking elements without mistakes.\n"
+        f"You MUST return a JSON object with two fields:\n"
+        f"- \"verified\": boolean (true if both written and spoken phrases are correct and match the required phrase, false if they made any mistakes, omitted writing/speaking, or targeted the wrong person)\n"
+        f"- \"feedback\": a brief description explaining why they succeeded or failed (e.g. \"Perfect execution\", \"Spoke the wrong name: Bob instead of Alice\", \"Did not write anything on paper\", etc.)"
+    )
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": "video/mp4",
+                            "data": video_base64
+                        }
+                    },
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                print(f"Gemini API returned error code {response.status_code}: {response.text}")
+                return True, f"Error calling Gemini ({response.status_code}). Defaulting to success."
+            
+            result = response.json()
+            # Parse the content
+            text_response = result['candidates'][0]['content']['parts'][0]['text']
+            data = json.loads(text_response)
+            verified = bool(data.get("verified", False))
+            feedback = str(data.get("feedback", "No feedback provided."))
+            return verified, feedback
+            
+    except Exception as e:
+        print(f"Failed to verify video using Gemini: {e}")
+        return True, f"Verification failed to run: {str(e)}. Defaulting to success."
+
 manager = ConnectionManager()
+
 
 def check_victory_conditions(room_code: str) -> str:
     """Evaluates the living population to see if a side has won."""
@@ -98,20 +164,32 @@ def check_victory_conditions(room_code: str) -> str:
         return "MAFIA"
     return None
 
-@router.websocket("/ws/{room_code}/{player_name}")
-async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: str):
-    await manager.connect(websocket, room_code, player_name)
-    
-    # Sync room status with the newly joined player
-    state = GAME_ROOMS[room_code]
+async def broadcast_room_sync(room_code: str):
+    state = GAME_ROOMS.get(room_code)
+    if not state:
+        return
+    dead_roles = {
+        p: state["roles"].get(p, "STUDENT")
+        for p, is_alive in state["alive"].items()
+        if not is_alive
+    }
     await manager.broadcast_to_room({
         "event": "room_sync",
         "players": state["players"],
         "profiles": state["profiles"],
         "host": state.get("host"),
         "phase": state.get("phase", "LOBBY"),
-        "alive": state.get("alive", {})
+        "alive": state.get("alive", {}),
+        "dead_roles": dead_roles
     }, room_code)
+
+@router.websocket("/ws/{room_code}/{player_name}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: str):
+    await manager.connect(websocket, room_code, player_name)
+    state = GAME_ROOMS.get(room_code)
+    
+    # Sync room status with the newly joined player
+    await broadcast_room_sync(room_code)
     
     await manager.broadcast_to_room({
         "event": "player_joined",
@@ -120,7 +198,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
     }, room_code)
 
     # If the game has already started, resend the player's role to them!
-    if state.get("phase") in ["DAY", "NIGHT"]:
+    if state and state.get("phase") in ["DAY", "NIGHT"]:
         role = state["roles"].get(player_name)
         if role:
             await manager.send_personal_message({
@@ -189,9 +267,10 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 target = packet.get("target")
                 state["night_actions"][role] = target
                 
-                # Cache the recorded video if it's the MAFIA action
+                # Cache the recorded video and ritual details if it's the MAFIA action
                 if role == "MAFIA":
                     state["murder_video"] = packet.get("videoBase64")
+                    state["murder_phrase"] = packet.get("killPhrase")
                 
                 # If the action is initiated by the COP, immediately reply with alignment result
                 if role == "COP":
@@ -220,26 +299,47 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 victim = None
                 murder_video = None
                 doctor_saved = False
+                ritual_status = None
+                ritual_feedback = None
                 
                 if mafia_target:
-                    if doctor_target and mafia_target == doctor_target:
-                        doctor_saved = True
+                    murder_video = state.get("murder_video")
+                    murder_phrase = state.get("murder_phrase")
+                    
+                    verified = True
+                    feedback = "No ritual video was submitted."
+                    
+                    if murder_video:
+                        verified, feedback = await verify_ritual_video(murder_video, mafia_target, murder_phrase)
+                    
+                    if verified:
+                        ritual_status = "success"
+                        ritual_feedback = feedback
+                        if doctor_target and mafia_target == doctor_target:
+                            doctor_saved = True
+                        else:
+                            victim = mafia_target
+                            state["alive"][victim] = False
                     else:
-                        victim = mafia_target
-                        murder_video = state.get("murder_video")
-                        state["alive"][victim] = False
+                        ritual_status = "failed"
+                        ritual_feedback = feedback
 
                 # Clear entries for next round
                 state["night_actions"].clear()
                 state["votes"].clear()
                 if "murder_video" in state:
                     del state["murder_video"]
+                if "murder_phrase" in state:
+                    del state["murder_phrase"]
 
                 await manager.broadcast_to_room({
                     "event": "morning_briefing",
                     "victim": victim,
                     "videoBase64": murder_video,
-                    "doctorSaved": doctor_saved
+                    "doctorSaved": doctor_saved,
+                    "ritual_status": ritual_status,
+                    "ritual_feedback": ritual_feedback,
+                    "attempted_target": mafia_target
                 }, room_code)
 
                 # Check if the night murder ended the match
@@ -261,10 +361,13 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 if state.get("phase") != "DAY":
                     continue
                 state["phase"] = "NIGHT"
-                winner = check_victory_conditions(room_code)
-                if winner:
-                    await manager.broadcast_to_room({"event": "game_over", "winner": winner}, room_code)
-                    continue
+
+                # Check for failure to vote system execution penalty
+                failed_to_vote = []
+                for p in state["players"]:
+                    if state["alive"].get(p, False) and p not in state["votes"]:
+                        failed_to_vote.append(p)
+                        state["alive"][p] = False
 
                 vote_counts = {}
                 for tgt in state["votes"].values():
@@ -277,13 +380,15 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                     # Only execute if there isn't an absolute tie
                     if len(highest_voted) == 1:
                         executed = highest_voted[0]
-                        state["alive"][executed] = False
+                        if executed not in failed_to_vote:
+                            state["alive"][executed] = False
 
                 state["votes"].clear()
 
                 await manager.broadcast_to_room({
                     "event": "dusk_briefing",
-                    "executed": executed
+                    "executed": executed,
+                    "failed_to_vote": failed_to_vote
                 }, room_code)
 
                 # Check if the execution ended the match
@@ -296,14 +401,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
         manager.disconnect(room_code, player_name)
         state = GAME_ROOMS.get(room_code)
         if state:
-            await manager.broadcast_to_room({
-                "event": "room_sync",
-                "players": state["players"],
-                "profiles": state["profiles"],
-                "host": state.get("host"),
-                "phase": state.get("phase", "LOBBY"),
-                "alive": state.get("alive", {})
-            }, room_code)
+            await broadcast_room_sync(room_code)
         await manager.broadcast_to_room({
             "event": "player_left",
             "player_name": player_name,
