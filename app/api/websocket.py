@@ -412,6 +412,47 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_name: 
                 
                 await broadcast_room_sync(room_code)
 
+            # 8. SEND CHAT MESSAGE
+            elif action == "send_chat":
+                channel = packet.get("channel", "public")
+                message = packet.get("message")
+                if not message:
+                    continue
+                
+                # Check if player is alive
+                if not state["alive"].get(player_name, False):
+                    continue
+                
+                if channel == "public":
+                    # Public chat only allowed during DAY phase
+                    if state.get("phase") != "DAY":
+                        continue
+                    
+                    await manager.broadcast_to_room({
+                        "event": "chat_message",
+                        "channel": "public",
+                        "sender": player_name,
+                        "message": message
+                    }, room_code)
+                    
+                elif channel == "mafia":
+                    # Mafia chat only allowed during NIGHT phase and for MAFIA players
+                    if state.get("phase") != "NIGHT":
+                        continue
+                    if state["roles"].get(player_name) != "MAFIA":
+                        continue
+                    
+                    # Find all living mafia players in this room
+                    mafia_players = [p for p in state["players"] if state["roles"].get(p) == "MAFIA" and state["alive"].get(p, False)]
+                    for m_player in mafia_players:
+                        await manager.send_personal_message({
+                            "event": "chat_message",
+                            "channel": "mafia",
+                            "sender": player_name,
+                            "message": message
+                        }, room_code, m_player)
+
+
     except WebSocketDisconnect:
         manager.disconnect(room_code, player_name)
         state = GAME_ROOMS.get(room_code)
